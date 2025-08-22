@@ -1,8 +1,10 @@
 # Sky Gradient
 
-The current sky at your approximate location, rendered as a CSS gradient based on atmospheric physics. Refreshes every minute.
+The current sky at a given location, rendered as a CSS gradient based on atmospheric physics. Refreshes every minute.
 
-PHP port of the original JavaScript/TypeScript implementation by [Daniel Lazaro](https://github.com/dnlzro/horizon) (deployed at: https://sky.dlazaro.ca)
+PHP port of the original JavaScript/TypeScript implementation by [Daniel Lazaro](https://github.com/dnlzro/horizon) (deployed at: https://sky.dlazaro.ca). 
+
+IP geolocation feature removed for simplicity and privacy.
 
 ## Attribution
 
