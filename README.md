@@ -1,12 +1,8 @@
-# Horizon
+# Sky Gradient
 
-The current sky at your approximate location, rendered as a CSS gradient. Refreshes every minute.
+The current sky at your approximate location, rendered as a CSS gradient based on atmospheric physics. Refreshes every minute.
 
-Created for [HTML Day 2025](https://html.energy/html-day/2025/index.html) as a showcase of CSS gradients and the little-known `meta http-equiv="Refresh"` HTML tag ([MDN](https://developer.mozilla.org/en-US/docs/Web/HTML/Reference/Elements/meta/http-equiv)).
-
-The page is rendered on-demand by a server. No JavaScript is sent to the client.
-
-Featured at #1 on [Hacker News](https://news.ycombinator.com/item?id=44846281).
+PHP port of the original JavaScript/TypeScript implementation by [Daniel Lazaro](https://github.com/dnlzro/horizon) (deployed at: https://sky.dlazaro.ca)
 
 ## Attribution
 
