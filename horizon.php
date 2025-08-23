@@ -9,16 +9,16 @@
 
 // Fixed location:
 define('LATITUDE', 51.285335);
-define('LONGITUDE', 9.787075);
+define('LONGITUDE', 9.787075-100);
 
 // Physical constants and coefficients
 define('PI', M_PI);
 
 // Coefficients of media components (m^-1)
-$RAYLEIGH_SCATTER = [5.802e-6, 13.558e-6, 33.1e-6];
+define('RAYLEIGH_SCATTER', [5.802e-6, 13.558e-6, 33.1e-6]);
 define('MIE_SCATTER', 3.996e-6);
 define('MIE_ABSORB', 4.44e-6);
-$OZONE_ABSORB = [0.65e-6, 1.881e-6, 0.085e-6];
+define('OZONE_ABSORB', [0.65e-6, 1.881e-6, 0.085e-6]);
 
 // Altitude density distribution metrics
 define('RAYLEIGH_SCALE_HEIGHT', 8e3);
@@ -49,25 +49,42 @@ function dot($v1, $v2) {
     return $v1[0] * $v2[0] + $v1[1] * $v2[1] + $v1[2] * $v2[2];
 }
 
-function vec_length($v) {
+function vectorLength($v) {
+    if (!is_array($v) || count($v) !== 3) {
+        throw new InvalidArgumentException('Vector must be an array of 3 elements');
+    }
     return sqrt($v[0] * $v[0] + $v[1] * $v[1] + $v[2] * $v[2]);
 }
 
 function normalize($v) {
-    $l = vec_length($v);
-    if ($l == 0) $l = 1;
+    $l = vectorLength($v);
+    if ($l == 0.0) {
+        return [0.0, 0.0, 0.0]; // Return zero vector for zero-length input
+    }
     return [$v[0] / $l, $v[1] / $l, $v[2] / $l];
 }
 
-function vec_add($v1, $v2) {
+function vectorAdd($v1, $v2) {
+    if (!is_array($v1) || !is_array($v2) || count($v1) !== 3 || count($v2) !== 3) {
+        throw new InvalidArgumentException('Vectors must be arrays of 3 elements');
+    }
     return [$v1[0] + $v2[0], $v1[1] + $v2[1], $v1[2] + $v2[2]];
 }
 
-function vec_scale($v, $s) {
+function vectorScale($v, $s) {
+    if (!is_array($v) || count($v) !== 3) {
+        throw new InvalidArgumentException('Vector must be an array of 3 elements');
+    }
+    if (!is_numeric($s)) {
+        throw new InvalidArgumentException('Scalar must be numeric');
+    }
     return [$v[0] * $s, $v[1] * $s, $v[2] * $s];
 }
 
-function vec_exp($v) {
+function vectorExp($v) {
+    if (!is_array($v) || count($v) !== 3) {
+        throw new InvalidArgumentException('Vector must be an array of 3 elements');
+    }
     return [exp($v[0]), exp($v[1]), exp($v[2])];
 }
 
@@ -213,7 +230,6 @@ function intersectSphere($p, $d, $r) {
  * Compute transmittance through atmosphere
  */
 function computeTransmittance($height, $angle) {
-    global $RAYLEIGH_SCATTER, $OZONE_ABSORB;
     
     $rayOrigin = [0, GROUND_RADIUS + $height, 0];
     $rayDirection = [sin($angle), cos($angle), 0];
@@ -231,8 +247,8 @@ function computeTransmittance($height, $angle) {
     $odOzone = 0;
     
     for ($i = 0; $i < SAMPLES; $i++) {
-        $pos = vec_add($rayOrigin, vec_scale($rayDirection, $t));
-        $h = vec_length($pos) - GROUND_RADIUS;
+        $pos = vectorAdd($rayOrigin, vectorScale($rayDirection, $t));
+        $h = vectorLength($pos) - GROUND_RADIUS;
         
         $dR = exp(-$h / RAYLEIGH_SCALE_HEIGHT);
         $dM = exp(-$h / MIE_SCALE_HEIGHT);
@@ -247,16 +263,19 @@ function computeTransmittance($height, $angle) {
         $t += $segmentLength;
     }
     
+    $rayleighScatter = RAYLEIGH_SCATTER;
+    $ozoneAbsorb = OZONE_ABSORB;
+    
     $tauR = [
-        $RAYLEIGH_SCATTER[0] * $odRayleigh,
-        $RAYLEIGH_SCATTER[1] * $odRayleigh,
-        $RAYLEIGH_SCATTER[2] * $odRayleigh
+        $rayleighScatter[0] * $odRayleigh,
+        $rayleighScatter[1] * $odRayleigh,
+        $rayleighScatter[2] * $odRayleigh
     ];
     $tauM = [MIE_ABSORB * $odMie, MIE_ABSORB * $odMie, MIE_ABSORB * $odMie];
     $tauO = [
-        $OZONE_ABSORB[0] * $odOzone,
-        $OZONE_ABSORB[1] * $odOzone,
-        $OZONE_ABSORB[2] * $odOzone
+        $ozoneAbsorb[0] * $odOzone,
+        $ozoneAbsorb[1] * $odOzone,
+        $ozoneAbsorb[2] * $odOzone
     ];
     
     $tau = [
@@ -265,14 +284,16 @@ function computeTransmittance($height, $angle) {
         -($tauR[2] + $tauM[2] + $tauO[2])
     ];
     
-    return vec_exp($tau);
+    return vectorExp($tau);
 }
 
 /**
  * Render sky gradient based on solar elevation
  */
 function renderGradient($altitude) {
-    global $RAYLEIGH_SCATTER;
+    if (!is_numeric($altitude)) {
+        throw new InvalidArgumentException('Altitude must be numeric');
+    }
     
     $cameraPosition = [0, GROUND_RADIUS, 0];
     $sunDirection = normalize([cos($altitude), sin($altitude), 0]);
@@ -293,17 +314,17 @@ function renderGradient($altitude) {
             $segmentLength = $tExitTop / SAMPLES;
             $tRay = $segmentLength * 0.5;
             
-            $rayOriginRadius = vec_length($rayOrigin);
+            $rayOriginRadius = vectorLength($rayOrigin);
             $isRayPointingDownwardAtStart = dot($rayOrigin, $viewDirection) / $rayOriginRadius < 0.0;
             $startHeight = $rayOriginRadius - GROUND_RADIUS;
-            $startRayCos = clamp(dot(vec_scale($rayOrigin, 1.0 / $rayOriginRadius), $viewDirection), -1, 1);
+            $startRayCos = clamp(dot(vectorScale($rayOrigin, 1.0 / $rayOriginRadius), $viewDirection), -1, 1);
             $startRayAngle = acos(abs($startRayCos));
             $transmittanceCameraToSpace = computeTransmittance($startHeight, $startRayAngle);
             
             for ($j = 0; $j < SAMPLES; $j++) {
-                $samplePos = vec_add($rayOrigin, vec_scale($viewDirection, $tRay));
-                $sampleRadius = vec_length($samplePos);
-                $upUnit = vec_scale($samplePos, 1.0 / $sampleRadius);
+                $samplePos = vectorAdd($rayOrigin, vectorScale($viewDirection, $tRay));
+                $sampleRadius = vectorLength($samplePos);
+                $upUnit = vectorScale($samplePos, 1.0 / $sampleRadius);
                 $sampleHeight = $sampleRadius - GROUND_RADIUS;
                 
                 $viewCos = clamp(dot($upUnit, $viewDirection), -1, 1);
@@ -329,9 +350,10 @@ function renderGradient($altitude) {
                 $phaseR = rayleighPhase($sunViewAngle);
                 $phaseM = miePhase($sunViewAngle);
                 
+                $rayleighScatter = RAYLEIGH_SCATTER;
                 $scatteredRgb = [0, 0, 0];
                 for ($k = 0; $k < 3; $k++) {
-                    $rayleighTerm = $RAYLEIGH_SCATTER[$k] * $opticalDensityRay * $phaseR;
+                    $rayleighTerm = $rayleighScatter[$k] * $opticalDensityRay * $phaseR;
                     $mieTerm = MIE_SCATTER * $opticalDensityMie * $phaseM;
                     $scatteredRgb[$k] = $transmittanceLight[$k] * ($rayleighTerm + $mieTerm);
                 }
@@ -349,7 +371,7 @@ function renderGradient($altitude) {
         
         // Post-process
         $color = $inscattered;
-        $color = vec_scale($color, EXPOSURE);
+        $color = vectorScale($color, EXPOSURE);
         $color = applySunsetBias($color);
         $color = aces($color);
         $color = [pow($color[0], 1.0 / GAMMA), pow($color[1], 1.0 / GAMMA), pow($color[2], 1.0 / GAMMA)];
@@ -383,8 +405,16 @@ function renderGradient($altitude) {
 }
 
 // Main execution
-$sunElevation = calculateSunPosition(LATITUDE, LONGITUDE);
-list($gradient, $topVec, $bottomVec) = renderGradient($sunElevation);
+try {
+    $sunElevation = calculateSunPosition(LATITUDE, LONGITUDE);
+    list($gradient, $topVec, $bottomVec) = renderGradient($sunElevation);
+} catch (Exception $e) {
+    // Fallback to simple gradient on error
+    error_log('Sky gradient error: ' . $e->getMessage());
+    $gradient = 'linear-gradient(to bottom, #87CEEB 0%, #FFA500 100%)';
+    $topVec = [135, 206, 235];
+    $bottomVec = [255, 165, 0];
+}
 
 $top = "rgb({$topVec[0]}, {$topVec[1]}, {$topVec[2]})";
 $bottom = "rgb({$bottomVec[0]}, {$bottomVec[1]}, {$bottomVec[2]})";
