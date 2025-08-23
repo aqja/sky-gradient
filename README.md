@@ -4,7 +4,7 @@ The current sky at a given location, rendered as a CSS gradient based on atmosph
 
 PHP port of the original JavaScript/TypeScript implementation by [Daniel Lazaro](https://github.com/dnlzro/horizon) (deployed at: https://sky.dlazaro.ca). 
 
-IP geolocation feature removed for simplicity and privacy.
+IP geolocation feature removed for simplicity and privacy. Coordinates can be given as URL parameters: ```index.php?lat=72.5&lon=63.4```.
 
 ## Physics Implementation
 

@@ -8,6 +8,24 @@
  */
 
 /**
+ * Custom exceptions for better error handling
+ */
+class AtmosphericCalculationException extends Exception {}
+class SolarPositionException extends Exception {}
+class InvalidCoordinateException extends Exception {}
+
+/**
+ * Default configuration values
+ */
+class SkyDefaults {
+    public const DEFAULT_LATITUDE = 51.285335;
+    public const DEFAULT_LONGITUDE = 9.787075;
+    public const FALLBACK_GRADIENT = 'linear-gradient(to bottom, rgb(135, 206, 235) 0%, rgb(135, 206, 235) 100%)';
+    public const FALLBACK_COLOR = [135, 206, 235];
+    public const FALLBACK_SUN_ELEVATION = 0.0;
+}
+
+/**
  * Configuration class to hold all atmospheric and rendering parameters
  */
 class SkyConfig {
@@ -40,6 +58,11 @@ class SkyConfig {
     public float $gamma;
     public float $sunsetBiasStrength;
     
+    // Performance tuning
+    public int $maxTransmittanceCache;
+    public int $maxTrigCache;
+    public bool $enableCaching;
+    
     // Pre-calculated constants
     public float $fovRadians;
     public float $focalZ;
@@ -47,6 +70,9 @@ class SkyConfig {
     public array $phaseConstants;
     
     public function __construct(float $latitude = 51.285335, float $longitude = 9.787075) {
+        // Validate coordinates
+        $this->validateCoordinates($latitude, $longitude);
+        
         // Location
         $this->latitude = $latitude;
         $this->longitude = $longitude;
@@ -76,8 +102,22 @@ class SkyConfig {
         $this->gamma = 2.2;
         $this->sunsetBiasStrength = 0.1;
         
+        // Performance tuning (configurable cache sizes)
+        $this->maxTransmittanceCache = 1000;
+        $this->maxTrigCache = 500;
+        $this->enableCaching = true;
+        
         // Pre-calculate expensive constants
         $this->preCalculateConstants();
+    }
+    
+    private function validateCoordinates(float $latitude, float $longitude): void {
+        if (!is_finite($latitude) || $latitude < -90 || $latitude > 90) {
+            throw new InvalidCoordinateException('Latitude must be between -90 and 90 degrees');
+        }
+        if (!is_finite($longitude) || $longitude < -180 || $longitude > 180) {
+            throw new InvalidCoordinateException('Longitude must be between -180 and 180 degrees');
+        }
     }
     
     private function preCalculateConstants(): void {
@@ -121,7 +161,7 @@ class VectorMath {
     
     public static function normalize(array $v): array {
         $l = self::length($v);
-        if ($l == 0.0) {
+        if ($l === 0.0) {
             return [0.0, 0.0, 0.0];
         }
         return [$v[0] / $l, $v[1] / $l, $v[2] / $l];
@@ -154,11 +194,14 @@ class VectorMath {
  */
 class SolarCalculator {
     public static function calculatePosition(float $latitude, float $longitude, ?int $timestamp = null): float {
-        if (!is_numeric($latitude) || $latitude < -90 || $latitude > 90) {
-            throw new InvalidArgumentException('Latitude must be between -90 and 90 degrees');
+        if (!is_finite($latitude) || $latitude < -90 || $latitude > 90) {
+            throw new SolarPositionException('Latitude must be between -90 and 90 degrees');
         }
-        if (!is_numeric($longitude) || $longitude < -180 || $longitude > 180) {
-            throw new InvalidArgumentException('Longitude must be between -180 and 180 degrees');
+        if (!is_finite($longitude) || $longitude < -180 || $longitude > 180) {
+            throw new SolarPositionException('Longitude must be between -180 and 180 degrees');
+        }
+        if ($timestamp !== null && ($timestamp < 0 || $timestamp > 2147483647)) {
+            throw new SolarPositionException('Invalid timestamp');
         }
         
         if ($timestamp === null) {
@@ -227,13 +270,41 @@ class SolarCalculator {
  */
 class AtmosphericRenderer {
     private SkyConfig $config;
+    private array $transmittanceCache = [];
+    private array $trigCache = [];
+    private array $trigCacheOrder = []; // Track access order for LRU
+    private array $precomputedSamplePositions = [];
+    private bool $positionsCached = false;
     
     public function __construct(SkyConfig $config) {
         $this->config = $config;
     }
     
     /**
-     * ACES tonemapper (Knarkowicz)
+     * Clear all caches to free memory
+     */
+    public function clearCaches(): void {
+        $this->transmittanceCache = [];
+        $this->trigCache = [];
+        $this->trigCacheOrder = [];
+        $this->precomputedSamplePositions = [];
+        $this->positionsCached = false;
+    }
+    
+    /**
+     * Get cache statistics for monitoring
+     */
+    public function getCacheStats(): array {
+        return [
+            'transmittance_cache_size' => count($this->transmittanceCache),
+            'trig_cache_size' => count($this->trigCache),
+            'positions_cached' => $this->positionsCached,
+            'caching_enabled' => $this->config->enableCaching
+        ];
+    }
+    
+    /**
+     * ACES tonemapper (Knarkowicz) - with division by zero protection
      */
     private function aces(array $color): array {
         $result = [];
@@ -241,9 +312,80 @@ class AtmosphericRenderer {
             $c = $color[$i];
             $n = $c * (2.51 * $c + 0.03);
             $d = $c * (2.43 * $c + 0.59) + 0.14;
-            $result[$i] = max(0, min(1, $n / $d));
+            
+            // Protect against division by zero
+            if (abs($d) < 1e-10) {
+                $result[$i] = 0.0;
+            } else {
+                $result[$i] = max(0, min(1, $n / $d));
+            }
         }
         return $result;
+    }
+    
+    /**
+     * Cache expensive trigonometric calculations
+     */
+    private function getCachedTrig(string $func, float $value): float {
+        if (!$this->config->enableCaching) {
+            // Direct calculation if caching is disabled
+            switch ($func) {
+                case 'sin': return sin($value);
+                case 'cos': return cos($value);
+                case 'acos': return acos($value);
+                case 'exp': return exp($value);
+                default: throw new AtmosphericCalculationException("Unsupported trig function: $func");
+            }
+        }
+        
+        // Use more precise key generation to avoid floating point precision issues
+        $key = $func . '_' . sprintf('%.8f', $value);
+        if (!isset($this->trigCache[$key])) {
+            // Limit cache size for memory management using LRU
+            if (count($this->trigCache) >= $this->config->maxTrigCache) {
+                $this->evictLRUTrigCache();
+            }
+            
+            switch ($func) {
+                case 'sin': $this->trigCache[$key] = sin($value); break;
+                case 'cos': $this->trigCache[$key] = cos($value); break;
+                case 'acos': $this->trigCache[$key] = acos($value); break;
+                case 'exp': $this->trigCache[$key] = exp($value); break;
+                default: throw new AtmosphericCalculationException("Unsupported trig function: $func");
+            }
+        }
+        
+        // Update access order for LRU
+        $this->updateTrigCacheAccess($key);
+        return $this->trigCache[$key];
+    }
+    
+    /**
+     * Evict least recently used entries from trig cache
+     */
+    private function evictLRUTrigCache(): void {
+        $removeCount = intval($this->config->maxTrigCache * 0.25); // Remove 25% of cache
+        $keysToRemove = array_slice($this->trigCacheOrder, 0, $removeCount);
+        
+        foreach ($keysToRemove as $key) {
+            unset($this->trigCache[$key]);
+        }
+        
+        $this->trigCacheOrder = array_slice($this->trigCacheOrder, $removeCount);
+    }
+    
+    /**
+     * Update access order for LRU cache management
+     */
+    private function updateTrigCacheAccess(string $key): void {
+        // Remove key from current position
+        $currentPos = array_search($key, $this->trigCacheOrder);
+        if ($currentPos !== false) {
+            array_splice($this->trigCacheOrder, $currentPos, 1);
+        }
+        
+        // Add key to end (most recently used)
+        $this->trigCacheOrder[] = $key;
     }
     
     /**
@@ -268,21 +410,22 @@ class AtmosphericRenderer {
     }
     
     /**
-     * Rayleigh phase function (pre-calculated constants)
+     * Rayleigh phase function (pre-calculated constants with caching)
      */
     private function rayleighPhase(float $angle): float {
-        return $this->config->phaseConstants['rayleighScale'] * (1 + cos($angle) * cos($angle));
+        $cosAngle = $this->getCachedTrig('cos', $angle);
+        return $this->config->phaseConstants['rayleighScale'] * (1 + $cosAngle * $cosAngle);
     }
     
     /**
-     * Mie phase function (pre-calculated constants)
+     * Mie phase function (pre-calculated constants with caching)
      */
     private function miePhase(float $angle): float {
-        $cosAngle = cos($angle);
+        $cosAngle = $this->getCachedTrig('cos', $angle);
         $num = $this->config->phaseConstants['mieCoeff'] * (1 + $cosAngle * $cosAngle);
         $denom = $this->config->phaseConstants['mieDenom'] * 
                  pow((1 + $this->config->phaseConstants['mieG2'] - 
-                     2 * $this->config->phaseConstants['mieG'] * $cosAngle), 3/2);
+                     2 * $this->config->phaseConstants['mieG'] * $cosAngle), 1.5);
         return ($this->config->phaseConstants['mieScale'] * $num) / $denom;
     }
     
@@ -307,9 +450,16 @@ class AtmosphericRenderer {
     }
     
     /**
-     * Compute transmittance through atmosphere
+     * Compute transmittance through atmosphere (with caching)
      */
     private function computeTransmittance(float $height, float $angle): array {
+        // Create cache key with consistent precision - only if caching enabled
+        if ($this->config->enableCaching) {
+            $cacheKey = sprintf('%.3f_%.6f', $height, $angle);
+            if (isset($this->transmittanceCache[$cacheKey])) {
+                return $this->transmittanceCache[$cacheKey];
+            }
+        }
         $rayOrigin = [0, $this->config->groundRadius + $height, 0];
         $rayDirection = [sin($angle), cos($angle), 0];
         
@@ -333,8 +483,8 @@ class AtmosphericRenderer {
             $pos = VectorMath::add($rayOrigin, VectorMath::scale($rayDirection, $t));
             $h = VectorMath::length($pos) - $this->config->groundRadius;
             
-            $dR = exp(-$h * $invRayleighScale);
-            $dM = exp(-$h * $invMieScale);
+            $dR = $this->getCachedTrig('exp', -$h * $invRayleighScale);
+            $dM = $this->getCachedTrig('exp', -$h * $invMieScale);
             
             $odRayleigh += $dR * $segmentLength;
             
@@ -364,16 +514,50 @@ class AtmosphericRenderer {
             -($tauR[2] + $tauM[2] + $tauO[2])
         ];
         
-        return VectorMath::exp($tau);
+        $result = VectorMath::exp($tau);
+        
+        // Cache result (limit cache size to prevent memory issues)
+        if ($this->config->enableCaching && isset($cacheKey) && count($this->transmittanceCache) < $this->config->maxTransmittanceCache) {
+            $this->transmittanceCache[$cacheKey] = $result;
+        }
+        
+        return $result;
+    }
+    
+    /**
+     * Pre-compute sample positions and directions for reuse
+     */
+    private function precomputeSampleData(): void {
+        if ($this->positionsCached) {
+            return;
+        }
+        
+        $invSamplesMinusOne = 1.0 / ($this->config->samples - 1);
+        
+        for ($i = 0; $i < $this->config->samples; $i++) {
+            $s = $i * $invSamplesMinusOne;
+            $viewDirection = VectorMath::normalize([0, $s, $this->config->focalZ]);
+            
+            $this->precomputedSamplePositions[$i] = [
+                's' => $s,
+                'viewDirection' => $viewDirection,
+                'percent' => (1 - $s) * 100
+            ];
+        }
+        
+        $this->positionsCached = true;
     }
     
     /**
      * Render sky gradient based on solar elevation
      */
     public function renderGradient(float $altitude): array {
-        if (!is_numeric($altitude)) {
-            throw new InvalidArgumentException('Altitude must be numeric');
+        if (!is_finite($altitude)) {
+            throw new AtmosphericCalculationException('Altitude must be a valid finite number');
         }
+        
+        // Pre-compute sample data for efficiency
+        $this->precomputeSampleData();
         
         $cameraPosition = [0, $this->config->groundRadius, 0];
         $sunDirection = VectorMath::normalize([cos($altitude), sin($altitude), 0]);
@@ -381,12 +565,11 @@ class AtmosphericRenderer {
         $stops = [];
         
         // Pre-calculate constants outside the main loop
-        $invSamplesMinusOne = 1.0 / ($this->config->samples - 1);
         $invGamma = 1.0 / $this->config->gamma;
         
         for ($i = 0; $i < $this->config->samples; $i++) {
-            $s = $i * $invSamplesMinusOne;
-            $viewDirection = VectorMath::normalize([0, $s, $this->config->focalZ]);
+            $sampleData = $this->precomputedSamplePositions[$i];
+            $viewDirection = $sampleData['viewDirection'];
             
             $inscattered = [0, 0, 0];
             
@@ -415,8 +598,8 @@ class AtmosphericRenderer {
                     
                     $viewCos = VectorMath::clamp(VectorMath::dot($upUnit, $viewDirection), -1, 1);
                     $sunCos = VectorMath::clamp(VectorMath::dot($upUnit, $sunDirection), -1, 1);
-                    $viewAngle = acos(abs($viewCos));
-                    $sunAngle = acos($sunCos);
+                    $viewAngle = $this->getCachedTrig('acos', abs($viewCos));
+                    $sunAngle = $this->getCachedTrig('acos', $sunCos);
                     
                     $transmittanceToSpace = $this->computeTransmittance($sampleHeight, $viewAngle);
                     $transmittanceCameraToSample = [0, 0, 0];
@@ -429,10 +612,10 @@ class AtmosphericRenderer {
                     
                     $transmittanceLight = $this->computeTransmittance($sampleHeight, $sunAngle);
                     
-                    $opticalDensityRay = exp(-$sampleHeight * $invRayleighScale);
-                    $opticalDensityMie = exp(-$sampleHeight * $invMieScale);
+                    $opticalDensityRay = $this->getCachedTrig('exp', -$sampleHeight * $invRayleighScale);
+                    $opticalDensityMie = $this->getCachedTrig('exp', -$sampleHeight * $invMieScale);
                     $sunViewCos = VectorMath::clamp(VectorMath::dot($sunDirection, $viewDirection), -1, 1);
-                    $sunViewAngle = acos($sunViewCos);
+                    $sunViewAngle = $this->getCachedTrig('acos', $sunViewCos);
                     $phaseR = $this->rayleighPhase($sunViewAngle);
                     $phaseM = $this->miePhase($sunViewAngle);
                     
@@ -465,11 +648,10 @@ class AtmosphericRenderer {
                 round(VectorMath::clamp($color[2], 0, 1) * 255)
             ];
             
-            $percent = (1 - $s) * 100;
-            $stops[] = ['percent' => $percent, 'rgb' => $rgb];
+            $stops[] = ['percent' => $sampleData['percent'], 'rgb' => $rgb];
         }
         
-        // Sort stops and create CSS gradient
+        // Sort stops and create CSS gradient (optimized string building)
         usort($stops, function($a, $b) {
             return $a['percent'] <=> $b['percent'];
         });
@@ -477,7 +659,7 @@ class AtmosphericRenderer {
         $colorStops = [];
         foreach ($stops as $stop) {
             $rgb = $stop['rgb'];
-            $percent = round($stop['percent'] * 100) / 100;
+            $percent = round($stop['percent'], 2); // Single rounding
             $colorStops[] = "rgb({$rgb[0]}, {$rgb[1]}, {$rgb[2]}) {$percent}%";
         }
         
@@ -511,14 +693,44 @@ class SkyGradientGenerator {
             );
             
             return $this->renderer->renderGradient($sunElevation);
+        } catch (SolarPositionException | AtmosphericCalculationException $e) {
+            // Log specific atmospheric errors
+            error_log('Sky gradient calculation error: ' . $e->getMessage());
+            return $this->getFallbackGradient();
         } catch (Exception $e) {
-            // Fallback to simple gradient on error
-            error_log('Sky gradient error: ' . $e->getMessage());
-            return [
-                'linear-gradient(to bottom, #87CEEB 0%, #ff0000ff 100%)',
-                [135, 206, 235],
-                [255, 0, 0]
-            ];
+            // Log unexpected errors
+            error_log('Unexpected sky gradient error: ' . $e->getMessage());
+            return $this->getFallbackGradient();
+        }
+    }
+    
+    /**
+     * Get consistent fallback gradient values
+     */
+    private function getFallbackGradient(): array {
+        return [
+            SkyDefaults::FALLBACK_GRADIENT,
+            SkyDefaults::FALLBACK_COLOR,
+            SkyDefaults::FALLBACK_COLOR
+        ];
+    }
+    
+    /**
+     * Get fallback sun elevation
+     */
+    public function getFallbackSunElevation(): float {
+        return SkyDefaults::FALLBACK_SUN_ELEVATION;
+    }
+    
+    /**
+     * Get sun elevation with error handling
+     */
+    public function getSunElevationSafe(): float {
+        try {
+            return $this->getSunElevation();
+        } catch (Exception $e) {
+            error_log('Sun elevation calculation error: ' . $e->getMessage());
+            return $this->getFallbackSunElevation();
         }
     }
     
